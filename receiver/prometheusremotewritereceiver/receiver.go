@@ -18,6 +18,7 @@ import (
 	promconfig "github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/value"
+	writev1 "github.com/prometheus/prometheus/prompb"
 	writev2 "github.com/prometheus/prometheus/prompb/io/prometheus/write/v2"
 	promremote "github.com/prometheus/prometheus/storage/remote"
 	"go.opentelemetry.io/collector/component"
@@ -27,10 +28,40 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/receiver"
 	"go.opentelemetry.io/collector/receiver/receiverhelper"
+	semconv "go.opentelemetry.io/collector/semconv/v1.27.0"
 	"go.uber.org/zap/zapcore"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/exp/metrics/identity"
 )
+
+// resourceAttributeNameMap maps Prometheus labels to standard OpenTelemetry semantic conventions
+var resourceAttributeNameMap = map[string]string{
+	"job":                  semconv.AttributeServiceName, // Primary mapping for service name
+	"service":              semconv.AttributeServiceName, // Alternative mapping
+	"service.name":         semconv.AttributeServiceName, // Alternative mapping
+	"namespace":            semconv.AttributeServiceNamespace,
+	"pod":                  semconv.AttributeK8SPodName,
+	"node":                 semconv.AttributeK8SNodeName,
+	"kube.node":            semconv.AttributeK8SNodeName,
+	"host.name":            semconv.AttributeHostName,
+	"container.id":         semconv.AttributeContainerID,
+	"container.image.name": semconv.AttributeContainerImageName,
+	"container.image.tag":  semconv.AttributeContainerImageTags, // should render as a list...
+}
+
+// isResourceAttribute checks if a label should be promoted to resource level
+func isResourceAttribute(labelName string) bool {
+	_, exists := resourceAttributeNameMap[labelName]
+	return exists
+}
+
+// getResourceAttribute returns the mapped semantic convention attribute name for a given label
+func getResourceAttribute(labelName string) (string, bool) {
+	if mappedAttr, exists := resourceAttributeNameMap[labelName]; exists {
+		return mappedAttr, true
+	}
+	return "", false
+}
 
 func newRemoteWriteReceiver(settings receiver.Settings, cfg *Config, nextConsumer consumer.Metrics) (receiver.Metrics, error) {
 	cache, err := lru.New[uint64, pmetric.ResourceMetrics](1000)
@@ -160,12 +191,52 @@ func (prw *prometheusRemoteWriteReceiver) handlePRW(w http.ResponseWriter, req *
 		http.Error(w, err.Error(), http.StatusUnsupportedMediaType)
 		return
 	}
-	if msgType != promconfig.RemoteWriteProtoMsgV2 {
+
+	switch msgType {
+	case promconfig.RemoteWriteProtoMsgV1:
+		prw.handlePRWV1(w, req)
+	case promconfig.RemoteWriteProtoMsgV2:
+		prw.handlePRWV2(w, req)
+	default:
 		prw.settings.Logger.Warn("message received with unsupported proto version, rejecting")
 		http.Error(w, "Unsupported proto version", http.StatusUnsupportedMediaType)
 		return
 	}
+}
 
+func (prw *prometheusRemoteWriteReceiver) handlePRWV1(w http.ResponseWriter, req *http.Request) {
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		prw.settings.Logger.Warn("Error decoding remote write request", zapcore.Field{Key: "error", Type: zapcore.ErrorType, Interface: err})
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var prw1Req writev1.WriteRequest
+	if err = proto.Unmarshal(body, &prw1Req); err != nil {
+		prw.settings.Logger.Warn("Error decoding remote write request", zapcore.Field{Key: "error", Type: zapcore.ErrorType, Interface: err})
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	m, stats, err := prw.translateV1(req.Context(), &prw1Req)
+	stats.SetHeaders(w)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest) // Following instructions at https://prometheus.io/docs/instrumenting/exposition_formats/#text-based-format
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+
+	obsrecvCtx := prw.obsrecv.StartMetricsOp(req.Context())
+	err = prw.nextConsumer.ConsumeMetrics(req.Context(), m)
+	if err != nil {
+		prw.settings.Logger.Error("Error consuming metrics", zapcore.Field{Key: "error", Type: zapcore.ErrorType, Interface: err})
+	}
+	prw.obsrecv.EndMetricsOp(obsrecvCtx, "prometheusremotewritereceiver", m.ResourceMetrics().Len(), err)
+}
+
+func (prw *prometheusRemoteWriteReceiver) handlePRWV2(w http.ResponseWriter, req *http.Request) {
 	// After parsing the content-type header, the next step would be to handle content-encoding.
 	// Luckly confighttp's Server has middleware that already decompress the request body for us.
 
@@ -228,6 +299,168 @@ func (*prometheusRemoteWriteReceiver) parseProto(contentType string) (promconfig
 
 	// No "proto=" parameter found, assume v1.
 	return promconfig.RemoteWriteProtoMsgV1, nil
+}
+
+// translateV1 translates a v1 remote-write request into OTLP metrics.
+func (prw *prometheusRemoteWriteReceiver) translateV1(_ context.Context, v1r *writev1.WriteRequest) (pmetric.Metrics, promremote.WriteResponseStats, error) {
+	stats := promremote.WriteResponseStats{}
+	otelMetrics := pmetric.NewMetrics()
+	if v1r == nil {
+		return otelMetrics, stats, errors.New("empty request")
+	}
+
+	// The key is composed by: resource_hash:scope_name:scope_version:metric_name:unit:type
+	metricCache := make(map[uint64]pmetric.Metric)
+	var badRequestErrors error
+
+	for _, ts := range v1r.Timeseries {
+		// Convert labels to map for processing
+		ls := make(map[string]string)
+		for _, label := range ts.Labels {
+			ls[label.Name] = label.Value
+		}
+
+		// Extract scope info (same logic as v2)
+		scopeName, scopeVersion := prw.extractScopeInfoFromMap(ls)
+		metricName := getName(ls)
+		if metricName == "" {
+			badRequestErrors = errors.Join(badRequestErrors, errors.New("missing metric name"))
+			continue
+		}
+
+		// Handle regular metrics (gauge, counter, summary)
+		hashedLabels := xxhash.Sum64String(ls["job"] + string([]byte{'\xff'}) + ls["instance"])
+		existingRM, ok := prw.rmCache.Get(hashedLabels)
+		var rm pmetric.ResourceMetrics
+		if ok {
+			rm = existingRM
+		} else {
+			rm = otelMetrics.ResourceMetrics().AppendEmpty()
+
+			// Use semantic convention mapping for resource attributes
+			attrs := rm.Resource().Attributes()
+			for labelName, labelValue := range ls {
+				if mappedAttr, exists := resourceAttributeNameMap[labelName]; exists {
+					attrs.PutStr(mappedAttr, labelValue)
+				}
+			}
+
+			prw.rmCache.Add(hashedLabels, rm)
+		}
+
+		// Find or create scope
+		var scope pmetric.ScopeMetrics
+		var foundScope bool
+		for i := 0; i < rm.ScopeMetrics().Len(); i++ {
+			s := rm.ScopeMetrics().At(i)
+			if s.Scope().Name() == scopeName && s.Scope().Version() == scopeVersion {
+				scope = s
+				foundScope = true
+				break
+			}
+		}
+		if !foundScope {
+			scope = rm.ScopeMetrics().AppendEmpty()
+			scope.Scope().SetName(scopeName)
+			scope.Scope().SetVersion(scopeVersion)
+		}
+
+		// Get or create metric
+		metricIdentity := createMetricIdentity(
+			fmt.Sprintf("%d", hashedLabels),          // Resource identity as string
+			scopeName,                                // Scope name
+			scopeVersion,                             // Scope version
+			metricName,                               // Metric name
+			"",                                       // Unit (not available in v1)
+			writev2.Metadata_METRIC_TYPE_UNSPECIFIED, // Type (not available in v1)
+		)
+
+		metricKey := metricIdentity.Hash()
+		metric, exists := metricCache[metricKey]
+		if !exists {
+			// Simple classification: if it ends with .total, treat as counter, otherwise as gauge
+			if strings.HasSuffix(metricName, ".total") {
+				metric = setMetric(scope, metricName, "", "") // Empty unit and description for v1
+				sum := metric.SetEmptySum()
+				sum.SetIsMonotonic(true)
+				sum.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+			} else {
+				metric = setMetric(scope, metricName, "", "") // Empty unit and description for v1
+				metric.SetEmptyGauge()
+			}
+			metricCache[metricKey] = metric
+		}
+
+		// Add data points using the same pattern as v2
+		if strings.HasSuffix(metricName, ".total") {
+			addNumberDatapointsV1(metric.Sum().DataPoints(), ls, ts, &stats)
+		} else {
+			addNumberDatapointsV1(metric.Gauge().DataPoints(), ls, ts, &stats)
+		}
+	}
+
+	return otelMetrics, stats, badRequestErrors
+}
+
+// addNumberDatapointsV1 adds the labels to the datapoints attributes for v1 protocol.
+// This is similar to addNumberDatapoints but adapted for v1 data structure.
+func addNumberDatapointsV1(datapoints pmetric.NumberDataPointSlice, ls map[string]string, ts writev1.TimeSeries, stats *promremote.WriteResponseStats) {
+	// Add samples from the timeseries
+	for _, sample := range ts.Samples {
+		dp := datapoints.AppendEmpty()
+		// For v1, we don't have created timestamp, so use sample timestamp
+		dp.SetStartTimestamp(pcommon.Timestamp(sample.Timestamp * int64(time.Millisecond)))
+		dp.SetTimestamp(pcommon.Timestamp(sample.Timestamp * int64(time.Millisecond)))
+		dp.SetDoubleValue(sample.Value)
+
+		// Use the same attribute extraction logic as v2
+		attributes := dp.Attributes()
+		extractAttributesV1(ls).CopyTo(attributes)
+	}
+	stats.Samples += len(ts.Samples)
+}
+
+// extractAttributesV1 returns all attributes different from job, instance, metric name and scope name/version for v1
+func extractAttributesV1(ls map[string]string) pcommon.Map {
+	attrs := pcommon.NewMap()
+	for labelName, labelValue := range ls {
+		if labelName == "instance" || labelName == "job" || // Become resource attributes
+			labelName == "__name__" || // Becomes metric name
+			labelName == "otel_scope_name" || labelName == "otel_scope_version" { // Becomes scope name and version
+			continue
+		}
+		attrs.PutStr(labelName, labelValue)
+	}
+	return attrs
+}
+
+// extractScopeInfoFromMap extracts scope information from labels map (for v1)
+func (prw *prometheusRemoteWriteReceiver) extractScopeInfoFromMap(ls map[string]string) (string, string) {
+	scopeName := prw.settings.BuildInfo.Description
+	scopeVersion := prw.settings.BuildInfo.Version
+
+	// Fallback to hardcoded defaults if build info is empty
+	if scopeName == "" {
+		scopeName = "prometheus"
+	}
+	if scopeVersion == "" {
+		scopeVersion = "1.0.0"
+	}
+
+	if sName := ls["otel_scope_name"]; sName != "" {
+		scopeName = sName
+	}
+	if sVersion := ls["otel_scope_version"]; sVersion != "" {
+		scopeVersion = sVersion
+	}
+	return scopeName, scopeVersion
+}
+
+func getName(labels map[string]string) string {
+	if name, ok := labels["__name__"]; ok {
+		return name
+	}
+	return ""
 }
 
 // translateV2 translates a v2 remote-write request into OTLP metrics.
